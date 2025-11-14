@@ -2,6 +2,8 @@ import os
 import json
 import re
 import asyncio
+from typing import List
+
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,6 +12,7 @@ from dotenv import load_dotenv
 from literature_search import LiteratureSearcher
 from pdf_processor import extract_text_from_pdf_base64
 from rag_utils import SimpleRAG
+import numpy as np
 
 
 def detect_language(text: str) -> str:
@@ -56,6 +59,66 @@ reasoning_client = AsyncOpenAI(
     api_key=os.getenv("SCI_MODEL_API_KEY")
 )
 
+# 嵌入模型客户端（如果配置了单独的嵌入服务）
+embedding_base_url = os.getenv("SCI_EMBEDDING_BASE_URL")
+embedding_api_key = os.getenv("SCI_EMBEDDING_API_KEY")
+if embedding_base_url and embedding_api_key:
+    embedding_client = AsyncOpenAI(
+        base_url=embedding_base_url,
+        api_key=embedding_api_key
+    )
+else:
+    embedding_client = client  # 使用主模型服务
+
+
+async def get_embedding(text: str) -> List[float]:
+    """
+    获取文本的嵌入向量
+    
+    Args:
+        text: 输入文本
+        
+    Returns:
+        嵌入向量
+    """
+    try:
+        embedding_model = os.getenv("SCI_EMBEDDING_MODEL", "text-embedding-v4")
+        response = await embedding_client.embeddings.create(
+            model=embedding_model,
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"获取嵌入向量错误: {e}")
+        return []
+
+
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """
+    计算余弦相似度
+    
+    Args:
+        vec1: 向量1
+        vec2: 向量2
+        
+    Returns:
+        相似度值（0-1之间）
+    """
+    if not vec1 or not vec2 or len(vec1) != len(vec2):
+        return 0.0
+    
+    vec1 = np.array(vec1)
+    vec2 = np.array(vec2)
+    
+    dot_product = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    return float(dot_product / (norm1 * norm2))
+
 
 @app.post("/literature_review")
 async def literature_review(request: Request):
@@ -86,63 +149,147 @@ async def literature_review(request: Request):
 
         async def generate():
             try:
-                # 步骤1: 搜索相关文献以增强上下文
+                # 步骤1: 搜索相关文献以增强上下文（包括最新和经典文献）
                 papers_context = ""
                 papers_references = []  # 用于存储参考文献信息
                 try:
                     searcher = LiteratureSearcher()
                     try:
-                        papers = await searcher.search_and_extract(
+                        # 并行搜索两类文献：最新文献（按时间）和高引用文献（按引用次数）
+                        # 1. 搜索最新文献（按时间降序）
+                        latest_papers_task = searcher.search_and_extract(
                             query=query,
-                            max_results=15,
+                            max_results=5,  # 最新文献
                             extract_pdf=False,
-                            sources=['openalex', 'crossref']
+                            sort_by='date'  # 按时间排序
                         )
+                        
+                        # 2. 搜索高引用文献（按引用次数降序）
+                        cited_papers_task = searcher.search_and_extract(
+                            query=query,
+                            max_results=5,  # 高引用文献
+                            extract_pdf=False,
+                            sources=['openalex', 'crossref'],
+                            sort_by='citations'  # 按引用次数排序
+                        )
+                        
+                        # 并行执行搜索
+                        latest_papers, cited_papers = await asyncio.gather(
+                            latest_papers_task,
+                            cited_papers_task,
+                            return_exceptions=True
+                        )
+                        
+                        # 处理异常
+                        if isinstance(latest_papers, Exception):
+                            print(f"[literature_review] 最新文献搜索错误: {latest_papers}")
+                            latest_papers = []
+                        if isinstance(cited_papers, Exception):
+                            print(f"[literature_review] 高引用文献搜索错误: {cited_papers}")
+                            cited_papers = []
+                        
+                        # 合并结果，去重（基于标题）
+                        all_papers = []
+                        seen_titles = set()
+                        
+                        # 先添加最新文献
+                        for paper in latest_papers:
+                            title = paper.get('title', '').lower().strip()
+                            if title and title not in seen_titles:
+                                all_papers.append(paper)
+                                seen_titles.add(title)
+                        
+                        # 再添加高引用文献（如果还没有达到上限）
+                        for paper in cited_papers:
+                            title = paper.get('title', '').lower().strip()
+                            if title and title not in seen_titles and len(all_papers) < 10:
+                                all_papers.append(paper)
+                                seen_titles.add(title)
+                        
+                        papers = all_papers
+                        
+                        print(f"[literature_review] 找到 {len(latest_papers)} 篇最新文献和 {len(cited_papers)} 篇高引用文献，合并后共 {len(papers)} 篇")
                         
                         # 构建论文摘要信息（只包含有摘要的文献，根据语言调整格式）
                         if papers:
                             papers_list = []
-                            ref_index = 1
                             for paper in papers:
                                 # 只处理有摘要的文献
                                 if not paper.get('abstract') or not paper.get('abstract').strip():
                                     continue
                                 
+                                # 提取作者和年份信息
+                                authors = paper.get('authors', [])[:3] if paper.get('authors') else []
+                                published = paper.get('published', '')
+                                # 从published中提取年份
+                                year = ''
+                                if published:
+                                    year_match = re.search(r'(\d{4})', published)
+                                    if year_match:
+                                        year = year_match.group(1)
+                                
+                                # 构建作者姓氏（用于引用）
+                                author_surname = ''
+                                if authors:
+                                    # 取第一个作者的姓氏（最后一个词，假设格式为 "First Last" 或 "Last, First"）
+                                    first_author = authors[0]
+                                    if ',' in first_author:
+                                        # 格式为 "Last, First"
+                                        author_surname = first_author.split(',')[0].strip()
+                                    else:
+                                        # 格式为 "First Last" 或 "First Middle Last"
+                                        author_surname = first_author.split()[-1]
+                                else:
+                                    author_surname = 'Unknown'
+                                
+                                # 保存作者姓氏和年份，用于生成引用
+                                # 引用格式可以是：(Smith, 2023) 或 Smith (2023)
+                                
+                                # 构建引用标识（用于在prompt中标识论文）
+                                if year:
+                                    if len(authors) > 1:
+                                        citation_label = f"{author_surname} et al. ({year})"
+                                    else:
+                                        citation_label = f"{author_surname} ({year})"
+                                else:
+                                    citation_label = author_surname
+                                
                                 # 构建论文信息
                                 if language == 'zh':
-                                    paper_info = f"[{ref_index}] {paper.get('title', '未知')}"
+                                    paper_info = f"{citation_label}: {paper.get('title', '未知')}"
                                     authors_str = ""
-                                    if paper.get('authors'):
-                                        authors_str = ', '.join(paper.get('authors', [])[:3])
-                                        paper_info += f" - {authors_str}"
-                                    if paper.get('published'):
-                                        paper_info += f" ({paper.get('published')})"
+                                    if authors:
+                                        authors_str = ', '.join(authors)
+                                        paper_info += f"\n   作者: {authors_str}"
+                                    if published:
+                                        paper_info += f"\n   发表年份: {published}"
                                     paper_info += f"\n   摘要: {paper.get('abstract', '')[:300]}"
                                 else:
-                                    paper_info = f"[{ref_index}] {paper.get('title', 'Unknown')}"
+                                    paper_info = f"{citation_label}: {paper.get('title', 'Unknown')}"
                                     authors_str = ""
-                                    if paper.get('authors'):
-                                        authors_str = ', '.join(paper.get('authors', [])[:3])
-                                        paper_info += f" - {authors_str}"
-                                    if paper.get('published'):
-                                        paper_info += f" ({paper.get('published')})"
+                                    if authors:
+                                        authors_str = ', '.join(authors)
+                                        paper_info += f"\n   Authors: {authors_str}"
+                                    if published:
+                                        paper_info += f"\n   Published: {published}"
                                     paper_info += f"\n   Abstract: {paper.get('abstract', '')[:300]}"
                                 
                                 papers_list.append(paper_info)
                                 
                                 # 保存参考文献信息用于后续引用
                                 ref_info = {
-                                    'index': ref_index,
+                                    'author_surname': author_surname,
                                     'title': paper.get('title', ''),
-                                    'authors': paper.get('authors', [])[:3] if paper.get('authors') else [],
-                                    'published': paper.get('published', ''),
+                                    'authors': authors,
+                                    'published': published,
+                                    'year': year,
                                     'url': paper.get('url', ''),
-                                    'doi': paper.get('doi', '')
+                                    'doi': paper.get('doi', ''),
+                                    'multiple_authors': len(authors) > 1
                                 }
                                 papers_references.append(ref_info)
                                 
-                                ref_index += 1
-                                if ref_index > 10:  # 最多10篇文献
+                                if len(papers_references) >= 10:  # 最多10篇文献
                                     break
                             
                             if papers_list:
@@ -159,7 +306,11 @@ async def literature_review(request: Request):
                 # 步骤2: 根据语言准备prompt进行文献综述
                 if language == 'zh':
                     citation_instruction = """
-在综述中，请使用 [1], [2], [3] 等格式引用上述文献。在适当的地方插入引用，例如："根据研究[1]，transformer模型在自然语言处理中取得了显著进展。"
+在综述中，请使用作者年份格式引用上述文献。可以使用两种格式：
+1. 括号内引用格式：(Smith, 2023) 或 (Smith et al., 2023)，例如："transformer模型在自然语言处理中取得了显著进展 (Smith et al., 2023)。"
+2. 作者在前格式：Smith (2023) 或 Smith et al. (2023)，例如："Smith et al. (2023) 提出了..." 或 "根据 Smith (2023) 的研究..."
+
+请在适当的地方插入引用，根据语境选择合适的格式。
 """
                     if not papers_context:
                         citation_instruction = ""
@@ -180,10 +331,14 @@ async def literature_review(request: Request):
 
 {citation_instruction}
 
-请确保综述全面、准确、有深度，并在适当的地方使用文献引用 [1], [2], [3] 等格式。"""
+请确保综述全面、准确、有深度，并在适当的地方使用作者年份格式的文献引用，如 (Smith, 2023)、(Smith et al., 2023)、Smith (2023) 或 Smith et al. (2023)。"""
                 else:
                     citation_instruction = """
-In your review, please cite the above papers using [1], [2], [3] format. Insert citations at appropriate places, for example: "According to research [1], transformer models have achieved significant progress in natural language processing."
+In your review, please cite the above papers using author-year format. You can use two formats:
+1. Parenthetical citation: (Smith, 2023) or (Smith et al., 2023), for example: "transformer models have achieved significant progress in natural language processing (Smith et al., 2023)."
+2. Narrative citation: Smith (2023) or Smith et al. (2023), for example: "Smith et al. (2023) proposed..." or "According to Smith (2023)..."
+
+Insert citations at appropriate places and choose the format that fits the context.
 """
                     if not papers_context:
                         citation_instruction = ""
@@ -204,7 +359,7 @@ Please provide a structured literature review in Markdown format covering:
 
 {citation_instruction}
 
-Ensure the review is thorough, accurate, and insightful, and use citations [1], [2], [3] etc. at appropriate places."""
+Ensure the review is thorough, accurate, and insightful, and use author-year format citations like (Smith, 2023), (Smith et al., 2023), Smith (2023), or Smith et al. (2023) at appropriate places."""
 
                 # 调用LLM模型进行流式生成
                 stream = await client.chat.completions.create(
@@ -215,11 +370,15 @@ Ensure the review is thorough, accurate, and insightful, and use citations [1], 
                     stream=True
                 )
 
+                # 收集完整的生成文本，用于提取实际引用的文献
+                full_text = ""
+                
                 # 流式返回结果（使用JSON格式）
                 async for chunk in stream:
                     if chunk.choices and len(chunk.choices) > 0:
                         delta_content = chunk.choices[0].delta.content
                         if delta_content:
+                            full_text += delta_content
                             response_data = {
                                 "object": "chat.completion.chunk",
                                 "choices": [{
@@ -230,45 +389,110 @@ Ensure the review is thorough, accurate, and insightful, and use citations [1], 
                             }
                             yield f"data: {json.dumps(response_data)}\n\n"
 
-                # 在综述末尾添加参考文献列表
-                if papers_references:
-                    if language == 'zh':
-                        references_text = "\n\n## 参考文献\n\n"
-                    else:
-                        references_text = "\n\n## References\n\n"
+                # 在综述末尾添加参考文献列表（只包含文中实际引用的文献）
+                if papers_references and full_text:
+                    # 提取文中实际使用的引用
+                    cited_refs = []
                     
+                    # 为每个参考文献创建匹配模式
                     for ref in papers_references:
-                        if language == 'zh':
-                            authors_str = ', '.join(ref['authors']) if ref['authors'] else '未知作者'
-                            ref_line = f"[{ref['index']}] {ref['title']}. {authors_str}"
-                            if ref['published']:
-                                ref_line += f" ({ref['published']})"
-                            if ref['doi']:
-                                ref_line += f". DOI: {ref['doi']}"
-                            elif ref['url']:
-                                ref_line += f". URL: {ref['url']}"
-                        else:
-                            authors_str = ', '.join(ref['authors']) if ref['authors'] else 'Unknown Authors'
-                            ref_line = f"[{ref['index']}] {ref['title']}. {authors_str}"
-                            if ref['published']:
-                                ref_line += f" ({ref['published']})"
-                            if ref['doi']:
-                                ref_line += f". DOI: {ref['doi']}"
-                            elif ref['url']:
-                                ref_line += f". URL: {ref['url']}"
+                        author_surname = ref.get('author_surname', 'Unknown')
+                        year = ref.get('year', '')
+                        multiple_authors = ref.get('multiple_authors', False)
                         
-                        references_text += ref_line + "\n\n"
+                        # 构建可能的引用格式模式
+                        patterns = []
+                        if year:
+                            if multiple_authors:
+                                # (Smith et al., 2023) 或 Smith et al. (2023)
+                                patterns.append(f"({author_surname} et al\\.?,? {year})")
+                                patterns.append(f"{author_surname} et al\\.? \\({year}\\)")
+                            else:
+                                # (Smith, 2023) 或 Smith (2023)
+                                patterns.append(f"({author_surname},? {year})")
+                                patterns.append(f"{author_surname} \\({year}\\)")
+                        else:
+                            # 没有年份的情况
+                            if multiple_authors:
+                                patterns.append(f"{author_surname} et al\\.")
+                            else:
+                                patterns.append(author_surname)
+                        
+                        # 检查文本中是否包含这些引用模式
+                        cited = False
+                        for pattern in patterns:
+                            if re.search(pattern, full_text, re.IGNORECASE):
+                                cited = True
+                                break
+                        
+                        if cited:
+                            cited_refs.append(ref)
                     
-                    # 发送参考文献
-                    response_data = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{
-                            "delta": {
-                                "content": references_text
-                            }
-                        }]
-                    }
-                    yield f"data: {json.dumps(response_data)}\n\n"
+                    # 如果找到了引用的文献，按作者姓氏排序
+                    if cited_refs:
+                        def get_sort_key(ref):
+                            surname = ref.get('author_surname', 'Unknown').lower()
+                            year = ref.get('year', '')
+                            return (surname, year)
+                        
+                        sorted_refs = sorted(cited_refs, key=get_sort_key)
+                        
+                        if language == 'zh':
+                            references_text = "\n\n## 参考文献\n\n"
+                        else:
+                            references_text = "\n\n## References\n\n"
+                        
+                        for ref in sorted_refs:
+                            # 构建引用格式：作者 (年份). 标题. 发表信息
+                            author_surname = ref.get('author_surname', 'Unknown')
+                            year = ref.get('year', '')
+                            
+                            # 构建作者部分
+                            if ref['authors']:
+                                if len(ref['authors']) == 1:
+                                    authors_str = ref['authors'][0]
+                                elif len(ref['authors']) == 2:
+                                    authors_str = f"{ref['authors'][0]} & {ref['authors'][1]}"
+                                else:
+                                    authors_str = f"{ref['authors'][0]} et al."
+                            else:
+                                authors_str = 'Unknown Authors'
+                            
+                            if language == 'zh':
+                                if year:
+                                    ref_line = f"{authors_str} ({year}). {ref['title']}"
+                                else:
+                                    ref_line = f"{authors_str}. {ref['title']}"
+                                if ref['published']:
+                                    ref_line += f". {ref['published']}"
+                                if ref['doi']:
+                                    ref_line += f". DOI: {ref['doi']}"
+                                elif ref['url']:
+                                    ref_line += f". URL: {ref['url']}"
+                            else:
+                                if year:
+                                    ref_line = f"{authors_str} ({year}). {ref['title']}"
+                                else:
+                                    ref_line = f"{authors_str}. {ref['title']}"
+                                if ref['published']:
+                                    ref_line += f". {ref['published']}"
+                                if ref['doi']:
+                                    ref_line += f". DOI: {ref['doi']}"
+                                elif ref['url']:
+                                    ref_line += f". URL: {ref['url']}"
+                            
+                            references_text += ref_line + "\n\n"
+                        
+                        # 发送参考文献
+                        response_data = {
+                            "object": "chat.completion.chunk",
+                            "choices": [{
+                                "delta": {
+                                    "content": references_text
+                                }
+                            }]
+                        }
+                        yield f"data: {json.dumps(response_data)}\n\n"
 
                 yield "data: [DONE]\n\n"
                 
@@ -300,12 +524,13 @@ Ensure the review is thorough, accurate, and insightful, and use citations [1], 
 @app.post("/paper_qa")
 async def paper_qa(request: Request):
     """
-    PDF论文问答端点
+    Paper Q&A endpoint - uses reasoning model with PDF content
     
-    Input: {"query": "...", "pdf_content": "base64 string"}
-    Output: SSE stream of Markdown
-    
-    使用RAG技术从PDF中提取相关信息并回答问题
+    Request body:
+    {
+        "query": "Please carefully analyze and explain the reinforcement learning training methods used in this article.",
+        "pdf_content": "base64_encoded_pdf_content"
+    }
     """
     try:
         body = await request.json()
@@ -324,7 +549,8 @@ async def paper_qa(request: Request):
                 content={"error": "Bad Request", "message": "pdf_content is required"}
             )
 
-        print(f"[paper_qa] 查询: {query[:50]}...")
+        print(f"[paper_qa] Received query: {query}")
+        print(f"[paper_qa] Using reasoning model: {os.getenv('SCI_LLM_REASONING_MODEL')}")
 
         # 检测用户输入的语言
         language = detect_language(query)
@@ -336,46 +562,66 @@ async def paper_qa(request: Request):
                 pdf_text = extract_text_from_pdf_base64(pdf_content)
                 if not pdf_text:
                     error_msg = "无法从PDF中提取文本" if language == 'zh' else "Failed to extract text from PDF"
-                    yield f"data: {json.dumps({'object': 'error', 'message': error_msg})}\n\n"
+                    error_data = {
+                        "object": "error",
+                        "message": error_msg
+                    }
+                    yield f"data: {json.dumps(error_data)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 
-                # 使用RAG检索相关段落
-                rag = SimpleRAG()
-                relevant_chunks = await rag.retrieve_relevant_chunks(query, pdf_text, top_k=5)
-                context = "\n\n".join(relevant_chunks)
+                # 优化：如果PDF文本过长，使用RAG检索相关段落，否则直接使用全文
+                if len(pdf_text) > 8000:
+                    # 使用RAG检索相关段落以提高效率和准确性
+                    rag = SimpleRAG()
+                    relevant_chunks = await rag.retrieve_relevant_chunks(query, pdf_text, top_k=5)
+                    context = "\n\n".join(relevant_chunks)
+                    paper_content = context
+                else:
+                    # 文本较短，直接使用全文
+                    paper_content = pdf_text
                 
                 # 根据语言构建prompt
                 if language == 'zh':
-                    prompt = f"""你是一位学术论文分析专家。请基于以下PDF文档内容回答用户的问题。
+                    prompt = f"""请基于以下论文内容回答问题。
 
-用户问题: {query}
+论文内容:
 
-相关文档内容:
-{context}
+{paper_content}
 
-请基于文档内容准确回答问题。如果文档中没有相关信息，请说明。使用Markdown格式输出答案。"""
+问题: {query}
+
+请仔细分析论文内容，准确回答问题。如果论文中没有相关信息，请说明。使用Markdown格式输出答案。"""
                 else:
-                    prompt = f"""You are an academic paper analysis expert. Please answer the user's question based on the following PDF document content.
+                    prompt = f"""Answer the question based on the paper content.
 
-User Question: {query}
+Paper:
 
-Relevant Document Content:
-{context}
+{paper_content}
 
-Please answer accurately based on the document content. If there is no relevant information in the document, please state so. Output the answer in Markdown format."""
+Question: {query}"""
 
-                stream = await client.chat.completions.create(
-                    model=os.getenv("SCI_LLM_MODEL", "deepseek-chat"),
+                # 调用推理模型进行流式生成
+                stream = await reasoning_client.chat.completions.create(
+                    model=os.getenv("SCI_LLM_REASONING_MODEL", "deepseek-reasoner"),
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=2048,
                     temperature=0.2,
                     stream=True
                 )
 
+                # 流式返回结果
                 async for chunk in stream:
                     if chunk.choices and len(chunk.choices) > 0:
-                        delta_content = chunk.choices[0].delta.content
+                        delta = chunk.choices[0].delta
+                        
+                        # 提取并记录推理内容（如果模型支持）
+                        reasoning_content = getattr(delta, 'reasoning_content', None)
+                        if reasoning_content:
+                            print(f"[paper_qa] Reasoning: {reasoning_content}", flush=True)
+                        
+                        # 流式返回常规内容
+                        delta_content = delta.content
                         if delta_content:
                             response_data = {
                                 "object": "chat.completion.chunk",
@@ -391,14 +637,14 @@ Please answer accurately based on the document content. If there is no relevant 
                 
             except Exception as e:
                 print(f"[paper_qa] 错误: {e}")
-                yield f"data: [ERROR] {str(e)}\n\n"
+                error_data = {
+                    "object": "error",
+                    "message": str(e)
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
                 yield "data: [DONE]\n\n"
 
-        return StreamingResponse(
-            generate(), 
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no"}
-        )
+        return StreamingResponse(generate(), media_type="text/event-stream")
 
     except Exception as e:
         return JSONResponse(
@@ -410,12 +656,12 @@ Please answer accurately based on the document content. If there is no relevant 
 @app.post("/ideation")
 async def ideation(request: Request):
     """
-    研究想法生成端点
+    Ideation endpoint - uses embedding model for similarity and LLM for generation
     
-    Input: {"query": "..."}
-    Output: SSE stream of Markdown
-    
-    使用deepseek-reasoner生成新颖的研究想法
+    Request body:
+    {
+        "query": "Generate research ideas about climate change"
+    }
     """
     try:
         body = await request.json()
@@ -427,7 +673,20 @@ async def ideation(request: Request):
                 content={"error": "Bad Request", "message": "Query is required"}
             )
 
-        print(f"[ideation] 查询: {query}")
+        # 硬编码的参考想法用于测试嵌入模型
+        reference_ideas = [
+            "Using deep learning to predict protein folding structures",
+            "Applying transformer models to drug discovery and molecular design",
+            "Leveraging reinforcement learning for automated experiment design",
+            "Developing AI-powered literature review and knowledge synthesis tools",
+            "Creating neural networks for climate modeling and weather prediction",
+            "Using machine learning to analyze large-scale genomic datasets"
+        ]
+
+        print(f"[ideation] Received query: {query}")
+        print(f"[ideation] Using {len(reference_ideas)} hardcoded reference ideas for embedding similarity")
+        print(f"[ideation] Using LLM model: {os.getenv('SCI_LLM_MODEL')}")
+        print(f"[ideation] Using embedding model: {os.getenv('SCI_EMBEDDING_MODEL')}")
 
         # 检测用户输入的语言
         language = detect_language(query)
@@ -435,56 +694,61 @@ async def ideation(request: Request):
 
         async def generate():
             try:
-                # 根据语言构建prompt
+                # 构建基础prompt
                 if language == 'zh':
-                    prompt = f"""你是一位富有创造力的研究专家。请基于以下研究领域或问题，生成一个新颖的研究想法。
+                    prompt = f"""为以下研究领域生成创新的研究想法：
 
-研究领域/问题: {query}
-
-请生成一个创新的研究想法，使用Markdown格式，包含以下部分：
-
-## 问题
-清晰描述当前存在的问题或挑战。
-
-## 研究想法
-提出一个新颖的研究想法或解决方案。
-
-## 可行性
-分析该研究想法的技术可行性和实施难度。
-
-## 影响
-评估该研究想法的潜在影响和意义。
-
-请确保想法具有创新性、可行性和重要性。使用Markdown格式输出。"""
+{query}"""
                 else:
-                    prompt = f"""You are a creative research expert. Please generate a novel research idea based on the following research area or problem.
+                    prompt = f"""Generate innovative research ideas for:
 
-Research Area/Problem: {query}
+{query}"""
 
-Please generate an innovative research idea in Markdown format, including the following sections:
+                # 使用嵌入模型查找与硬编码参考想法的相似度
+                print("[ideation] Computing embeddings for similarity analysis...")
+                
+                # 获取查询的嵌入向量
+                query_embedding = await get_embedding(query)
+                
+                # 如果获取嵌入失败，直接生成想法
+                if not query_embedding:
+                    print("[ideation] Failed to get query embedding, generating ideas without similarity analysis")
+                else:
+                    # 获取参考想法的嵌入向量并计算相似度
+                    similarities = []
+                    for idx, idea in enumerate(reference_ideas):
+                        idea_embedding = await get_embedding(idea)
+                        if idea_embedding:
+                            similarity = cosine_similarity(query_embedding, idea_embedding)
+                            similarities.append((idx, idea, similarity))
+                    
+                    # 按相似度排序（最高优先）
+                    similarities.sort(key=lambda x: x[2], reverse=True)
+                    
+                    # 将相似度分析添加到prompt
+                    if language == 'zh':
+                        prompt += f"\n\n参考想法（按相似度排序）：\n"
+                    else:
+                        prompt += f"\n\nReference ideas (ranked by similarity):\n"
+                    
+                    for idx, idea, sim in similarities:
+                        prompt += f"\n{idx+1}. (similarity: {sim:.3f}) {idea}"
+                    
+                    if language == 'zh':
+                        prompt += "\n\n基于以上参考想法生成新颖的研究想法。"
+                    else:
+                        prompt += "\n\nGenerate novel research ideas based on the above."
 
-## Problem
-Clearly describe the current problems or challenges.
-
-## Idea
-Propose a novel research idea or solution.
-
-## Feasibility
-Analyze the technical feasibility and implementation difficulty of this research idea.
-
-## Impact
-Evaluate the potential impact and significance of this research idea.
-
-Ensure the idea is innovative, feasible, and significant. Output in Markdown format."""
-
-                stream = await reasoning_client.chat.completions.create(
-                    model=os.getenv("SCI_LLM_REASONING_MODEL", "deepseek-reasoner"),
+                # 调用LLM模型进行流式生成
+                stream = await client.chat.completions.create(
+                    model=os.getenv("SCI_LLM_MODEL", "deepseek-chat"),
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=2048,
                     temperature=0.7,
                     stream=True
                 )
 
+                # 流式返回结果
                 async for chunk in stream:
                     if chunk.choices and len(chunk.choices) > 0:
                         delta_content = chunk.choices[0].delta.content
@@ -501,14 +765,6 @@ Ensure the idea is innovative, feasible, and significant. Output in Markdown for
 
                 yield "data: [DONE]\n\n"
                 
-            except asyncio.TimeoutError:
-                error_msg = "请求超时（10分钟限制）" if language == 'zh' else "Request timeout (10 minutes limit)"
-                error_data = {
-                    "object": "error",
-                    "message": error_msg
-                }
-                yield f"data: {json.dumps(error_data)}\n\n"
-                yield "data: [DONE]\n\n"
             except Exception as e:
                 print(f"[ideation] 错误: {e}")
                 error_data = {
@@ -518,11 +774,7 @@ Ensure the idea is innovative, feasible, and significant. Output in Markdown for
                 yield f"data: {json.dumps(error_data)}\n\n"
                 yield "data: [DONE]\n\n"
 
-        return StreamingResponse(
-            generate(), 
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no"}
-        )
+        return StreamingResponse(generate(), media_type="text/event-stream")
 
     except Exception as e:
         return JSONResponse(
@@ -534,21 +786,17 @@ Ensure the idea is innovative, feasible, and significant. Output in Markdown for
 @app.post("/paper_review")
 async def paper_review(request: Request):
     """
-    论文评审端点
+    Paper review endpoint - uses LLM model with PDF content
     
-    Input: {"query": "...", "pdf_content": "base64 string"}
-    Output: SSE stream of Markdown
-    
-    必须包含以下部分：
-    - Summary
-    - Strengths
-    - Weaknesses / Concerns
-    - Questions for Authors
-    - Score (Overall, Novelty, Technical Quality, Clarity, Confidence)
+    Request body:
+    {
+        "query": "Please review this paper",  # optional, default review prompt will be used
+        "pdf_content": "base64_encoded_pdf_content"
+    }
     """
     try:
         body = await request.json()
-        query = body.get("query", "")
+        query = body.get("query", "Please provide a comprehensive review of this paper")
         pdf_content = body.get("pdf_content", "")
 
         if not pdf_content:
@@ -557,10 +805,11 @@ async def paper_review(request: Request):
                 content={"error": "Bad Request", "message": "pdf_content is required"}
             )
 
-        print(f"[paper_review] 开始评审论文...")
+        print(f"[paper_review] Received query: {query}")
+        print(f"[paper_review] Using model: {os.getenv('SCI_LLM_MODEL')}")
 
-        # 检测用户输入的语言（如果有query则检测query，否则默认英文）
-        language = detect_language(query) if query else 'en'
+        # 检测用户输入的语言
+        language = detect_language(query)
         print(f"[paper_review] Detected language: {language}")
 
         async def generate():
@@ -569,7 +818,11 @@ async def paper_review(request: Request):
                 pdf_text = extract_text_from_pdf_base64(pdf_content)
                 if not pdf_text:
                     error_msg = "无法从PDF中提取文本" if language == 'zh' else "Failed to extract text from PDF"
-                    yield f"data: {json.dumps({'object': 'error', 'message': error_msg})}\n\n"
+                    error_data = {
+                        "object": "error",
+                        "message": error_msg
+                    }
+                    yield f"data: {json.dumps(error_data)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 
@@ -578,91 +831,57 @@ async def paper_review(request: Request):
                     truncate_msg = "\n\n[文本已截断...]" if language == 'zh' else "\n\n[Text truncated...]"
                     pdf_text = pdf_text[:15000] + truncate_msg
                 
-                # 根据语言构建评审prompt
+                # 根据语言构建prompt
                 if language == 'zh':
-                    review_query = query if query else "请对这篇论文进行全面评审"
-                    prompt = f"""你是一位资深的学术论文评审专家。请对以下论文进行全面、客观的评审。
-
-评审重点: {review_query}
+                    prompt = f"""评审以下论文：
 
 论文内容:
+
 {pdf_text[:15000]}
 
-请生成详细的论文评审报告，使用Markdown格式，必须包含以下部分：
-
-## 摘要
-简要总结论文的主要内容、研究方法和主要发现。
-
-## 优点
-列出论文的主要优点和贡献。
-
-## 缺点/关注点
-指出论文的不足之处、存在的问题或需要改进的地方。
-
-## 给作者的问题
-提出3-5个关键问题，帮助作者改进论文。
-
-## 评分
-请对论文进行评分（每项满分10分，置信度满分5分）：
-- 总体评分: X/10
-- 新颖性: X/10
-- 技术质量: X/10
-- 清晰度: X/10
-- 置信度: X/5
-
-请确保评审客观、专业、有建设性。使用Markdown格式输出。"""
+指令: {query}"""
                 else:
-                    review_query = query if query else "Please conduct a comprehensive review of this paper"
-                    prompt = f"""You are a senior academic paper review expert. Please conduct a comprehensive and objective review of the following paper.
+                    prompt = f"""Review the following paper:
 
-Review Focus: {review_query}
+Paper:
 
-Paper Content:
 {pdf_text[:15000]}
 
-Please generate a detailed paper review report in Markdown format, which must include the following sections:
+Instruction: {query}"""
 
-## Summary
-Briefly summarize the main content, research methods, and key findings of the paper.
-
-## Strengths
-List the main advantages and contributions of the paper.
-
-## Weaknesses / Concerns
-Point out the shortcomings, problems, or areas that need improvement in the paper.
-
-## Questions for Authors
-Propose 3-5 key questions to help authors improve the paper.
-
-## Score
-Please score the paper (each item out of 10 points, Confidence out of 5 points):
-- Overall: X/10
-- Novelty: X/10
-- Technical Quality: X/10
-- Clarity: X/10
-- Confidence: X/5
-
-Ensure the review is objective, professional, and constructive. Output in Markdown format."""
-
-                stream = await reasoning_client.chat.completions.create(
-                    model=os.getenv("SCI_LLM_REASONING_MODEL", "deepseek-reasoner"),
+                # 调用LLM模型进行流式生成
+                stream = await client.chat.completions.create(
+                    model=os.getenv("SCI_LLM_MODEL", "deepseek-chat"),
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=4096,
                     temperature=0.3,
                     stream=True
                 )
 
+                # 流式返回结果
                 async for chunk in stream:
                     if chunk.choices and len(chunk.choices) > 0:
                         delta_content = chunk.choices[0].delta.content
                         if delta_content:
-                            yield f"data: {delta_content}\n\n"
+                            response_data = {
+                                "object": "chat.completion.chunk",
+                                "choices": [{
+                                    "delta": {
+                                        "content": delta_content
+                                    }
+                                }]
+                            }
+                            yield f"data: {json.dumps(response_data)}\n\n"
 
                 yield "data: [DONE]\n\n"
                 
             except Exception as e:
                 print(f"[paper_review] 错误: {e}")
-                yield f"data: [ERROR] {str(e)}\n\n"
+                error_data = {
+                    "object": "error",
+                    "message": str(e)
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
                 yield "data: [DONE]\n\n"
 
         return StreamingResponse(

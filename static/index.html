@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Scientist Challenge - API 测试页面</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -137,9 +139,111 @@
             min-height: 200px;
             max-height: 600px;
             overflow-y: auto;
-            font-family: 'Courier New', monospace;
             font-size: 14px;
             line-height: 1.6;
+        }
+        
+        .output.markdown {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        }
+        
+        .output.markdown h1,
+        .output.markdown h2,
+        .output.markdown h3,
+        .output.markdown h4 {
+            margin-top: 1.5em;
+            margin-bottom: 0.5em;
+            font-weight: 600;
+        }
+        
+        .output.markdown h1 {
+            font-size: 1.8em;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 0.3em;
+        }
+        
+        .output.markdown h2 {
+            font-size: 1.5em;
+            border-bottom: 1px solid #e0e0e0;
+            padding-bottom: 0.3em;
+        }
+        
+        .output.markdown h3 {
+            font-size: 1.3em;
+        }
+        
+        .output.markdown code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        .output.markdown pre {
+            background: #f4f4f4;
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            border-left: 4px solid #667eea;
+        }
+        
+        .output.markdown pre code {
+            background: none;
+            padding: 0;
+        }
+        
+        .output.markdown ul,
+        .output.markdown ol {
+            margin: 1em 0;
+            padding-left: 2em;
+        }
+        
+        .output.markdown li {
+            margin: 0.5em 0;
+        }
+        
+        .output.markdown blockquote {
+            border-left: 4px solid #667eea;
+            padding-left: 1em;
+            margin: 1em 0;
+            color: #666;
+            font-style: italic;
+        }
+        
+        .output.markdown table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 1em 0;
+        }
+        
+        .output.markdown table th,
+        .output.markdown table td {
+            border: 1px solid #ddd;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        
+        .output.markdown table th {
+            background: #f8f9fa;
+            font-weight: 600;
+        }
+        
+        .output.markdown a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        
+        .output.markdown a:hover {
+            text-decoration: underline;
+        }
+        
+        .output.markdown p {
+            margin: 1em 0;
+        }
+        
+        .output.raw {
+            font-family: 'Courier New', monospace;
             white-space: pre-wrap;
             word-wrap: break-word;
         }
@@ -301,9 +405,37 @@
             event.target.classList.add('active');
         }
 
+        // Markdown内容缓存
+        const markdownCache = {};
+        
         function clearOutput(outputId) {
-            document.getElementById(outputId).textContent = '';
-            document.getElementById(outputId).className = 'output';
+            const output = document.getElementById(outputId);
+            output.textContent = '';
+            output.className = 'output';
+            markdownCache[outputId] = '';
+        }
+        
+        function appendMarkdown(outputId, text) {
+            const output = document.getElementById(outputId);
+            if (!markdownCache[outputId]) {
+                markdownCache[outputId] = '';
+            }
+            markdownCache[outputId] += text;
+            
+            // 使用marked.js渲染Markdown
+            try {
+                const html = marked.parse(markdownCache[outputId]);
+                const cleanHtml = DOMPurify.sanitize(html);
+                output.innerHTML = cleanHtml;
+                output.className = 'output markdown';
+                
+                // 自动滚动到底部
+                output.scrollTop = output.scrollHeight;
+            } catch (e) {
+                // 如果Markdown解析失败，使用原始文本
+                output.textContent = markdownCache[outputId];
+                output.className = 'output raw';
+            }
         }
 
         function handleFileSelect(fileInputId, textareaId, fileNameId) {
@@ -334,12 +466,14 @@
             const output = document.getElementById('lr-output');
             
             if (!query) {
-                output.textContent = '错误: 请输入研究主题';
-                output.className = 'output error';
+                markdownCache['lr-output'] = '**错误**: 请输入研究主题';
+                appendMarkdown('lr-output', '');
+                output.className = 'output error markdown';
                 return;
             }
 
-            output.textContent = '正在生成文献综述...\n';
+            markdownCache['lr-output'] = '';
+            output.textContent = '正在生成文献综述...';
             output.className = 'output loading';
 
             try {
@@ -371,32 +505,38 @@
                         if (line.startsWith('data: ')) {
                             const data = line.slice(6);
                             if (data === '[DONE]') {
-                                output.className = 'output success';
+                                output.className = 'output success markdown';
                                 return;
                             }
                             try {
                                 const jsonData = JSON.parse(data);
+                                const outputId = output.id;
                                 if (jsonData.object === 'error') {
-                                    output.textContent += `[ERROR] ${jsonData.message}\n`;
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${jsonData.message}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else if (jsonData.choices && jsonData.choices[0] && jsonData.choices[0].delta && jsonData.choices[0].delta.content) {
-                                    output.textContent += jsonData.choices[0].delta.content;
+                                    appendMarkdown(outputId, jsonData.choices[0].delta.content);
                                 }
                             } catch (e) {
                                 // 如果不是JSON，直接显示（兼容旧格式）
+                                const outputId = output.id;
                                 if (data.startsWith('[ERROR]')) {
-                                    output.textContent += data + '\n';
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${data.replace('[ERROR]', '')}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else {
-                                    output.textContent += data;
+                                    appendMarkdown(outputId, data);
                                 }
                             }
                         }
                     }
                 }
             } catch (error) {
-                output.textContent = `错误: ${error.message}`;
-                output.className = 'output error';
+                const outputId = output.id;
+                markdownCache[outputId] = `**错误**: ${error.message}`;
+                appendMarkdown(outputId, '');
+                output.className = 'output error markdown';
             }
         }
 
@@ -406,18 +546,21 @@
             const output = document.getElementById('qa-output');
             
             if (!query) {
-                output.textContent = '错误: 请输入问题';
-                output.className = 'output error';
+                markdownCache['qa-output'] = '**错误**: 请输入问题';
+                appendMarkdown('qa-output', '');
+                output.className = 'output error markdown';
                 return;
             }
             
             if (!pdfContent) {
-                output.textContent = '错误: 请提供PDF内容（Base64编码）';
-                output.className = 'output error';
+                markdownCache['qa-output'] = '**错误**: 请提供PDF内容（Base64编码）';
+                appendMarkdown('qa-output', '');
+                output.className = 'output error markdown';
                 return;
             }
 
-            output.textContent = '正在分析PDF并回答问题...\n';
+            markdownCache['qa-output'] = '';
+            output.textContent = '正在分析PDF并回答问题...';
             output.className = 'output loading';
 
             try {
@@ -449,32 +592,38 @@
                         if (line.startsWith('data: ')) {
                             const data = line.slice(6);
                             if (data === '[DONE]') {
-                                output.className = 'output success';
+                                output.className = 'output success markdown';
                                 return;
                             }
                             try {
                                 const jsonData = JSON.parse(data);
+                                const outputId = output.id;
                                 if (jsonData.object === 'error') {
-                                    output.textContent += `[ERROR] ${jsonData.message}\n`;
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${jsonData.message}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else if (jsonData.choices && jsonData.choices[0] && jsonData.choices[0].delta && jsonData.choices[0].delta.content) {
-                                    output.textContent += jsonData.choices[0].delta.content;
+                                    appendMarkdown(outputId, jsonData.choices[0].delta.content);
                                 }
                             } catch (e) {
                                 // 如果不是JSON，直接显示（兼容旧格式）
+                                const outputId = output.id;
                                 if (data.startsWith('[ERROR]')) {
-                                    output.textContent += data + '\n';
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${data.replace('[ERROR]', '')}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else {
-                                    output.textContent += data;
+                                    appendMarkdown(outputId, data);
                                 }
                             }
                         }
                     }
                 }
             } catch (error) {
-                output.textContent = `错误: ${error.message}`;
-                output.className = 'output error';
+                const outputId = output.id;
+                markdownCache[outputId] = `**错误**: ${error.message}`;
+                appendMarkdown(outputId, '');
+                output.className = 'output error markdown';
             }
         }
 
@@ -483,12 +632,14 @@
             const output = document.getElementById('idea-output');
             
             if (!query) {
-                output.textContent = '错误: 请输入研究领域或问题';
-                output.className = 'output error';
+                markdownCache['idea-output'] = '**错误**: 请输入研究领域或问题';
+                appendMarkdown('idea-output', '');
+                output.className = 'output error markdown';
                 return;
             }
 
-            output.textContent = '正在生成研究想法...\n';
+            markdownCache['idea-output'] = '';
+            output.textContent = '正在生成研究想法...';
             output.className = 'output loading';
 
             try {
@@ -520,32 +671,38 @@
                         if (line.startsWith('data: ')) {
                             const data = line.slice(6);
                             if (data === '[DONE]') {
-                                output.className = 'output success';
+                                output.className = 'output success markdown';
                                 return;
                             }
                             try {
                                 const jsonData = JSON.parse(data);
+                                const outputId = output.id;
                                 if (jsonData.object === 'error') {
-                                    output.textContent += `[ERROR] ${jsonData.message}\n`;
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${jsonData.message}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else if (jsonData.choices && jsonData.choices[0] && jsonData.choices[0].delta && jsonData.choices[0].delta.content) {
-                                    output.textContent += jsonData.choices[0].delta.content;
+                                    appendMarkdown(outputId, jsonData.choices[0].delta.content);
                                 }
                             } catch (e) {
                                 // 如果不是JSON，直接显示（兼容旧格式）
+                                const outputId = output.id;
                                 if (data.startsWith('[ERROR]')) {
-                                    output.textContent += data + '\n';
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${data.replace('[ERROR]', '')}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else {
-                                    output.textContent += data;
+                                    appendMarkdown(outputId, data);
                                 }
                             }
                         }
                     }
                 }
             } catch (error) {
-                output.textContent = `错误: ${error.message}`;
-                output.className = 'output error';
+                const outputId = output.id;
+                markdownCache[outputId] = `**错误**: ${error.message}`;
+                appendMarkdown(outputId, '');
+                output.className = 'output error markdown';
             }
         }
 
@@ -555,12 +712,14 @@
             const output = document.getElementById('review-output');
             
             if (!pdfContent) {
-                output.textContent = '错误: 请提供PDF内容（Base64编码）';
-                output.className = 'output error';
+                markdownCache['review-output'] = '**错误**: 请提供PDF内容（Base64编码）';
+                appendMarkdown('review-output', '');
+                output.className = 'output error markdown';
                 return;
             }
 
-            output.textContent = '正在评审论文...\n';
+            markdownCache['review-output'] = '';
+            output.textContent = '正在评审论文...';
             output.className = 'output loading';
 
             try {
@@ -595,32 +754,38 @@
                         if (line.startsWith('data: ')) {
                             const data = line.slice(6);
                             if (data === '[DONE]') {
-                                output.className = 'output success';
+                                output.className = 'output success markdown';
                                 return;
                             }
                             try {
                                 const jsonData = JSON.parse(data);
+                                const outputId = output.id;
                                 if (jsonData.object === 'error') {
-                                    output.textContent += `[ERROR] ${jsonData.message}\n`;
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${jsonData.message}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else if (jsonData.choices && jsonData.choices[0] && jsonData.choices[0].delta && jsonData.choices[0].delta.content) {
-                                    output.textContent += jsonData.choices[0].delta.content;
+                                    appendMarkdown(outputId, jsonData.choices[0].delta.content);
                                 }
                             } catch (e) {
                                 // 如果不是JSON，直接显示（兼容旧格式）
+                                const outputId = output.id;
                                 if (data.startsWith('[ERROR]')) {
-                                    output.textContent += data + '\n';
-                                    output.className = 'output error';
+                                    markdownCache[outputId] += `\n\n**错误**: ${data.replace('[ERROR]', '')}\n\n`;
+                                    appendMarkdown(outputId, '');
+                                    output.className = 'output error markdown';
                                 } else {
-                                    output.textContent += data;
+                                    appendMarkdown(outputId, data);
                                 }
                             }
                         }
                     }
                 }
             } catch (error) {
-                output.textContent = `错误: ${error.message}`;
-                output.className = 'output error';
+                const outputId = output.id;
+                markdownCache[outputId] = `**错误**: ${error.message}`;
+                appendMarkdown(outputId, '');
+                output.className = 'output error markdown';
             }
         }
     </script>
