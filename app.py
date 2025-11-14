@@ -159,7 +159,7 @@ async def literature_review(request: Request):
                         # 1. 搜索最新文献（按时间降序）
                         latest_papers_task = searcher.search_and_extract(
                             query=query,
-                            max_results=5,  # 最新文献
+                            max_results=10,  # 最新文献
                             extract_pdf=False,
                             sort_by='date'  # 按时间排序
                         )
@@ -167,9 +167,8 @@ async def literature_review(request: Request):
                         # 2. 搜索高引用文献（按引用次数降序）
                         cited_papers_task = searcher.search_and_extract(
                             query=query,
-                            max_results=5,  # 高引用文献
+                            max_results=10,  # 高引用文献
                             extract_pdf=False,
-                            sources=['openalex', 'crossref'],
                             sort_by='citations'  # 按引用次数排序
                         )
                         
@@ -390,43 +389,55 @@ Ensure the review is thorough, accurate, and insightful, and use author-year for
                             yield f"data: {json.dumps(response_data)}\n\n"
 
                 # 在综述末尾添加参考文献列表（只包含文中实际引用的文献）
-                if papers_references and full_text:
+                if papers_references:
+                    print(f"[literature_review] 开始检测引用，共有 {len(papers_references)} 篇参考文献")
+                    
                     # 提取文中实际使用的引用
                     cited_refs = []
                     
-                    # 为每个参考文献创建匹配模式
-                    for ref in papers_references:
-                        author_surname = ref.get('author_surname', 'Unknown')
-                        year = ref.get('year', '')
-                        multiple_authors = ref.get('multiple_authors', False)
+                    if full_text:
+                        print(f"[literature_review] 生成文本长度: {len(full_text)} 字符")
                         
-                        # 构建可能的引用格式模式
-                        patterns = []
-                        if year:
-                            if multiple_authors:
-                                # (Smith et al., 2023) 或 Smith et al. (2023)
-                                patterns.append(f"({author_surname} et al\\.?,? {year})")
-                                patterns.append(f"{author_surname} et al\\.? \\({year}\\)")
+                        # 为每个参考文献创建匹配模式
+                        for ref in papers_references:
+                            author_surname = ref.get('author_surname', 'Unknown')
+                            year = ref.get('year', '')
+                            multiple_authors = ref.get('multiple_authors', False)
+                            
+                            # 构建可能的引用格式模式
+                            patterns = []
+                            if year:
+                                if multiple_authors:
+                                    # (Smith et al., 2023) 或 Smith et al. (2023)
+                                    patterns.append(f"({re.escape(author_surname)} et al\\.?,? {year})")
+                                    patterns.append(f"{re.escape(author_surname)} et al\\.? \\({year}\\)")
+                                else:
+                                    # (Smith, 2023) 或 Smith (2023)
+                                    patterns.append(f"({re.escape(author_surname)},? {year})")
+                                    patterns.append(f"{re.escape(author_surname)} \\({year}\\)")
                             else:
-                                # (Smith, 2023) 或 Smith (2023)
-                                patterns.append(f"({author_surname},? {year})")
-                                patterns.append(f"{author_surname} \\({year}\\)")
-                        else:
-                            # 没有年份的情况
-                            if multiple_authors:
-                                patterns.append(f"{author_surname} et al\\.")
-                            else:
-                                patterns.append(author_surname)
-                        
-                        # 检查文本中是否包含这些引用模式
-                        cited = False
-                        for pattern in patterns:
-                            if re.search(pattern, full_text, re.IGNORECASE):
-                                cited = True
-                                break
-                        
-                        if cited:
-                            cited_refs.append(ref)
+                                # 没有年份的情况
+                                if multiple_authors:
+                                    patterns.append(f"{re.escape(author_surname)} et al\\.")
+                                else:
+                                    patterns.append(re.escape(author_surname))
+                            
+                            # 检查文本中是否包含这些引用模式
+                            cited = False
+                            for pattern in patterns:
+                                if re.search(pattern, full_text, re.IGNORECASE):
+                                    cited = True
+                                    print(f"[literature_review] 找到引用: {author_surname} ({year})")
+                                    break
+                            
+                            if cited:
+                                cited_refs.append(ref)
+                    else:
+                        print(f"[literature_review] 警告: full_text 为空，无法检测引用")
+                        # 如果文本为空，使用所有参考文献
+                        cited_refs = papers_references
+                    
+                    print(f"[literature_review] 检测到 {len(cited_refs)} 篇被引用的文献")
                     
                     # 如果找到了引用的文献，按作者姓氏排序
                     if cited_refs:
@@ -483,6 +494,8 @@ Ensure the review is thorough, accurate, and insightful, and use author-year for
                             
                             references_text += ref_line + "\n\n"
                         
+                        print(f"[literature_review] 准备发送参考文献列表，共 {len(sorted_refs)} 篇")
+                        
                         # 发送参考文献
                         response_data = {
                             "object": "chat.completion.chunk",
@@ -493,6 +506,10 @@ Ensure the review is thorough, accurate, and insightful, and use author-year for
                             }]
                         }
                         yield f"data: {json.dumps(response_data)}\n\n"
+                    else:
+                        print(f"[literature_review] 警告: 未找到任何被引用的文献")
+                else:
+                    print(f"[literature_review] 警告: papers_references 为空")
 
                 yield "data: [DONE]\n\n"
                 
