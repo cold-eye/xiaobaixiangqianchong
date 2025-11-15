@@ -15,31 +15,6 @@ from rag_utils import SimpleRAG
 import numpy as np
 
 
-def detect_language(text: str) -> str:
-    """
-    检测文本的主要语言
-    
-    Args:
-        text: 输入文本
-        
-    Returns:
-        'zh' 表示中文，'en' 表示英文
-    """
-    if not text:
-        return 'en'
-    
-    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-    total_chars = len(re.findall(r'[a-zA-Z\u4e00-\u9fff]', text))
-    
-    if total_chars == 0:
-        return 'en'
-    
-    # 如果中文字符占比超过30%，认为是中文
-    if chinese_chars / total_chars > 0.3:
-        return 'zh'
-    
-    return 'en'
-
 load_dotenv()
 
 app = FastAPI(title="AI Scientist Challenge Submission")
@@ -65,6 +40,32 @@ if embedding_base_url and embedding_api_key:
     )
 else:
     embedding_client = client
+
+
+def detect_language(text: str) -> str:
+    """
+    检测文本的主要语言
+
+    Args:
+        text: 输入文本
+
+    Returns:
+        'zh' 表示中文，'en' 表示英文
+    """
+    if not text:
+        return 'en'
+
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    total_chars = len(re.findall(r'[a-zA-Z\u4e00-\u9fff]', text))
+
+    if total_chars == 0:
+        return 'en'
+
+    # 如果中文字符占比超过30%，认为是中文
+    if chinese_chars / total_chars > 0.3:
+        return 'zh'
+
+    return 'en'
 
 
 async def get_embedding(text: str) -> List[float]:
@@ -296,14 +297,44 @@ async def literature_review(request: Request):
 {citation_instruction}
 
 请提供一份结构化的文献综述，使用Markdown格式，包含以下部分：
-- 研究背景：该研究领域的历史背景和重要性
-- 关键主题：主要研究主题和核心概念
-- 研究趋势：最新发展和新兴技术
-- 研究空白：局限性、未解决的问题和未来研究方向
+
+1. **研究背景**
+   - 该研究领域的历史发展和演进过程
+   - 该领域的重要性和现实意义
+   - 研究问题产生的背景和动机
+
+2. **关键主题**
+   - 该领域的核心研究主题和概念框架
+   - 主要理论观点和方法论
+   - 关键技术的原理和应用
+
+3. **研究现状**
+   - 当前研究的主要进展和突破
+   - 不同研究方向的发展状况
+   - 重要研究成果和发现
+
+4. **研究趋势**
+   - 最新发展和前沿技术
+   - 新兴的研究方向和方法
+   - 技术演进趋势
+
+5. **研究空白**
+   - 当前研究的局限性
+   - 尚未解决的问题和挑战
+   - 潜在的改进方向
+
+6. **结论**
+   - 总结该领域的研究现状和主要贡献
+   - 概述关键研究发现和进展
+   - 指出未来研究的重要方向和机会
 
 {citation_instruction}
 
-请确保综述全面、准确、有深度，并在适当的地方使用作者年份格式的文献引用，如 (Smith, 2023)、(Smith et al., 2023)、Smith (2023) 或 Smith et al. (2023)。"""
+写作要求：
+- 确保综述全面、准确、有深度，体现对领域的深入理解
+- 在适当的地方使用作者年份格式的文献引用，如 (Smith, 2023)、(Smith et al., 2023)、Smith (2023) 或 Smith et al. (2023)
+- 保持逻辑清晰，各部分之间衔接自然
+- 结论部分应综合前述内容，提出有价值的见解"""
                 else:
                     citation_instruction = """
 In your review, please cite the above papers using author-year format. You can use two formats:
@@ -324,14 +355,44 @@ Insert citations at appropriate places and choose the format that fits the conte
 {citation_instruction}
 
 Please provide a structured literature review in Markdown format covering:
-- Background: Historical context and importance of the research area
-- Key Themes: Main research themes and core concepts
-- Current Trends: Recent developments and emerging technologies
-- Research Gaps: Limitations, unsolved problems, and future directions
+
+1. **Background**
+   - Historical development and evolution of the research field
+   - Significance and real-world importance of the area
+   - Context and motivation for the research questions
+
+2. **Key Themes**
+   - Core research themes and conceptual frameworks
+   - Main theoretical perspectives and methodologies
+   - Principles and applications of key technologies
+
+3. **Current State**
+   - Major advances and breakthroughs in current research
+   - Development status of different research directions
+   - Important research outcomes and findings
+
+4. **Research Trends**
+   - Latest developments and cutting-edge technologies
+   - Emerging research directions and methods
+   - Technological evolution trends
+
+5. **Research Gaps**
+   - Limitations of current research
+   - Unsolved problems and challenges
+   - Potential areas for improvement
+
+6. **Conclusion**
+   - Summarize the current state of research and major contributions in the field
+   - Outline key research findings and progress
+   - Identify important future research directions and opportunities
 
 {citation_instruction}
 
-Ensure the review is thorough, accurate, and insightful, and use author-year format citations like (Smith, 2023), (Smith et al., 2023), Smith (2023), or Smith et al. (2023) at appropriate places."""
+Writing Requirements:
+- Ensure the review is thorough, accurate, and insightful, demonstrating deep understanding of the field
+- Use author-year format citations at appropriate places, such as (Smith, 2023), (Smith et al., 2023), Smith (2023), or Smith et al. (2023)
+- Maintain clear logic and natural transitions between sections
+- The conclusion should synthesize the preceding content and provide valuable insights"""
 
                 stream = await client.chat.completions.create(
                     model=os.getenv("SCI_LLM_MODEL", "deepseek-chat"),
@@ -371,27 +432,67 @@ Ensure the review is thorough, accurate, and insightful, and use author-year for
                             author_surname = ref.get('author_surname', 'Unknown')
                             year = ref.get('year', '')
                             multiple_authors = ref.get('multiple_authors', False)
+                            title = ref.get('title', '').lower()
                             
+                            # 构建更全面的匹配模式
                             patterns = []
                             if year:
                                 if multiple_authors:
+                                    # 多种 et al. 格式
                                     patterns.append(f"({re.escape(author_surname)} et al\\.?,? {year})")
+                                    patterns.append(f"({re.escape(author_surname)} et al\\.?, {year})")
                                     patterns.append(f"{re.escape(author_surname)} et al\\.? \\({year}\\)")
+                                    patterns.append(f"{re.escape(author_surname)} et al\\.? {year}")
+                                    # 支持中文环境下的格式
+                                    patterns.append(f"（{re.escape(author_surname)} et al\\.?,? {year}）")
+                                    patterns.append(f"（{re.escape(author_surname)}等,? {year}）")
                                 else:
+                                    # 单作者格式
                                     patterns.append(f"({re.escape(author_surname)},? {year})")
+                                    patterns.append(f"({re.escape(author_surname)} {year})")
                                     patterns.append(f"{re.escape(author_surname)} \\({year}\\)")
+                                    patterns.append(f"{re.escape(author_surname)} {year}")
+                                    # 支持中文环境下的格式
+                                    patterns.append(f"（{re.escape(author_surname)},? {year}）")
+                                    patterns.append(f"（{re.escape(author_surname)} {year}）")
                             else:
+                                # 没有年份的情况
                                 if multiple_authors:
                                     patterns.append(f"{re.escape(author_surname)} et al\\.")
+                                    patterns.append(f"{re.escape(author_surname)}等")
                                 else:
                                     patterns.append(re.escape(author_surname))
                             
                             cited = False
+                            # 先尝试模式匹配
                             for pattern in patterns:
                                 if re.search(pattern, full_text, re.IGNORECASE):
                                     cited = True
                                     print(f"[literature_review] 找到引用: {author_surname} ({year})")
                                     break
+                            
+                            # 如果模式匹配失败，尝试标题匹配（作为备用方案）
+                            if not cited and title:
+                                # 提取标题的关键词（前几个词）
+                                # 处理中文标题：按字符分割
+                                if any('\u4e00' <= char <= '\u9fff' for char in title):
+                                    # 中文标题：取前10个字符作为关键词
+                                    title_keywords = title[:10] if len(title) >= 10 else title
+                                    if len(title_keywords) > 3 and title_keywords in full_text.lower():
+                                        cited = True
+                                        print(f"[literature_review] 通过标题关键词找到引用: {author_surname} ({year})")
+                                else:
+                                    # 英文标题：取前5个词
+                                    title_words = title.split()[:5]
+                                    if title_words:
+                                        # 过滤掉太短的词（如 a, an, the, in, of 等）
+                                        important_words = [w for w in title_words if len(w) > 3]
+                                        if important_words:
+                                            # 检查至少3个重要词是否出现在文本中
+                                            found_count = sum(1 for word in important_words if re.search(r'\b' + re.escape(word) + r'\b', full_text, re.IGNORECASE))
+                                            if found_count >= min(3, len(important_words)):
+                                                cited = True
+                                                print(f"[literature_review] 通过标题关键词找到引用: {author_surname} ({year})")
                             
                             if cited:
                                 cited_refs.append(ref)
@@ -400,6 +501,17 @@ Ensure the review is thorough, accurate, and insightful, and use author-year for
                         cited_refs = papers_references
                     
                     print(f"[literature_review] 检测到 {len(cited_refs)} 篇被引用的文献")
+                    
+                    # 如果检测到的引用数量太少（少于提供的文献的50%），可能是检测逻辑有问题
+                    # 此时将所有提供的文献都包含进来（保守策略，确保完整性）
+                    if len(cited_refs) < len(papers_references) * 0.5 and len(papers_references) > 0:
+                        print(f"[literature_review] 警告: 检测到的引用数量较少（{len(cited_refs)}/{len(papers_references)}），可能是匹配模式问题")
+                        print(f"[literature_review] 将包含所有提供的文献以确保完整性")
+                        cited_refs = papers_references
+                    elif len(cited_refs) == 0 and len(papers_references) > 0:
+                        # 如果完全没有检测到引用，也包含所有文献
+                        print(f"[literature_review] 警告: 未检测到任何引用，将包含所有提供的文献")
+                        cited_refs = papers_references
                     
                     if cited_refs:
                         def get_sort_key(ref):
@@ -417,39 +529,163 @@ Ensure the review is thorough, accurate, and insightful, and use author-year for
                         for ref in sorted_refs:
                             author_surname = ref.get('author_surname', 'Unknown')
                             year = ref.get('year', '')
+                            title = ref.get('title', '')
+                            published = ref.get('published', '')
+                            doi = ref.get('doi', '')
+                            url = ref.get('url', '')
                             
-                            if ref['authors']:
-                                if len(ref['authors']) == 1:
-                                    authors_str = ref['authors'][0]
-                                elif len(ref['authors']) == 2:
-                                    authors_str = f"{ref['authors'][0]} & {ref['authors'][1]}"
+                            # 处理published字段，提取年份或格式化日期
+                            # 如果published是时间戳格式（如 2025-11-13T18:59:53Z），提取年份
+                            cleaned_published = None
+                            display_year = None
+                            
+                            if published:
+                                # 检查是否是时间戳格式（包含T或Z，或ISO 8601格式）
+                                if 'T' in published or 'Z' in published:
+                                    # ISO 8601时间戳格式，提取年份
+                                    year_match = re.search(r'(\d{4})', published)
+                                    if year_match:
+                                        display_year = year_match.group(1)
+                                    cleaned_published = None
+                                # 检查是否是日期格式（YYYY-MM-DD）
+                                elif re.match(r'^\d{4}-\d{2}-\d{2}', published):
+                                    # 日期格式，只提取年份
+                                    year_match = re.search(r'(\d{4})', published)
+                                    if year_match:
+                                        display_year = year_match.group(1)
+                                    cleaned_published = None
+                                # 检查是否是年月格式（YYYY-MM）
+                                elif re.match(r'^\d{4}-\d{2}$', published):
+                                    # 年月格式，保持原样但也可以作为年份使用
+                                    year_match = re.search(r'(\d{4})', published)
+                                    if year_match:
+                                        display_year = year_match.group(1)
+                                    cleaned_published = None
+                                # 检查是否是纯年份（YYYY）
+                                elif re.match(r'^\d{4}$', published):
+                                    display_year = published
+                                    cleaned_published = None
                                 else:
-                                    authors_str = f"{ref['authors'][0]} et al."
+                                    # 可能是期刊名或其他发表信息，保留原样
+                                    cleaned_published = published
+                                    # 如果其中包含年份，提取出来
+                                    year_match = re.search(r'(\d{4})', published)
+                                    if year_match:
+                                        extracted_year = year_match.group(1)
+                                        # 如果year字段存在且与提取的年份相同，使用year
+                                        if year and year == extracted_year:
+                                            display_year = year
+                                            cleaned_published = None
+                                        # 如果没有year字段，使用提取的年份
+                                        elif not year:
+                                            display_year = extracted_year
+                                            cleaned_published = None
+                            
+                            # 如果year字段存在且没有被使用，优先使用year
+                            if year and not display_year:
+                                display_year = year
+                            elif year and display_year and year != display_year:
+                                # 如果year和display_year不同，使用year（更准确）
+                                display_year = year
+                            
+                            # 格式化作者（Elsevier格式：姓, 名首字母缩写）
+                            if ref['authors']:
+                                authors_list = ref['authors']
+                                if len(authors_list) == 1:
+                                    # 单作者：姓, 名首字母缩写
+                                    author_parts = authors_list[0].split()
+                                    if len(author_parts) >= 2:
+                                        authors_str = f"{author_parts[-1]}, {'. '.join([p[0].upper() for p in author_parts[:-1]])}."
+                                    else:
+                                        authors_str = authors_list[0]
+                                elif len(authors_list) == 2:
+                                    # 两作者：姓1, 名1缩写, 姓2, 名2缩写（用逗号连接，最后用and）
+                                    author1_parts = authors_list[0].split()
+                                    author2_parts = authors_list[1].split()
+                                    if len(author1_parts) >= 2 and len(author2_parts) >= 2:
+                                        author1 = f"{author1_parts[-1]}, {'. '.join([p[0].upper() for p in author1_parts[:-1]])}."
+                                        author2 = f"{author2_parts[-1]}, {'. '.join([p[0].upper() for p in author2_parts[:-1]])}."
+                                        authors_str = f"{author1}, {author2}"
+                                    else:
+                                        authors_str = f"{authors_list[0]}, {authors_list[1]}"
+                                elif len(authors_list) <= 10:
+                                    # 3-10个作者：全部列出，用逗号分隔，最后一个用and连接
+                                    formatted_authors = []
+                                    for author in authors_list:
+                                        author_parts = author.split()
+                                        if len(author_parts) >= 2:
+                                            formatted_author = f"{author_parts[-1]}, {'. '.join([p[0].upper() for p in author_parts[:-1]])}."
+                                            formatted_authors.append(formatted_author)
+                                        else:
+                                            formatted_authors.append(author)
+                                    # 最后一个用and连接
+                                    if len(formatted_authors) > 1:
+                                        authors_str = ", ".join(formatted_authors[:-1]) + ", and " + formatted_authors[-1]
+                                    else:
+                                        authors_str = formatted_authors[0]
+                                else:
+                                    # 超过10个作者：前10个 + et al.
+                                    formatted_authors = []
+                                    for author in authors_list[:10]:
+                                        author_parts = author.split()
+                                        if len(author_parts) >= 2:
+                                            formatted_author = f"{author_parts[-1]}, {'. '.join([p[0].upper() for p in author_parts[:-1]])}."
+                                            formatted_authors.append(formatted_author)
+                                        else:
+                                            formatted_authors.append(author)
+                                    authors_str = ", ".join(formatted_authors) + ", et al."
                             else:
                                 authors_str = 'Unknown Authors'
                             
+                            # Elsevier格式：作者. 标题. 期刊名, 年份, 卷(期): 页码. DOI: xxx
+                            # 简化格式（无卷期页码时）：作者. 标题. 期刊名/发表信息, 年份. DOI: xxx
                             if language == 'zh':
-                                if year:
-                                    ref_line = f"{authors_str} ({year}). {ref['title']}"
-                                else:
-                                    ref_line = f"{authors_str}. {ref['title']}"
-                                if ref['published']:
-                                    ref_line += f". {ref['published']}"
-                                if ref['doi']:
-                                    ref_line += f". DOI: {ref['doi']}"
-                                elif ref['url']:
-                                    ref_line += f". URL: {ref['url']}"
+                                # 中文格式（Elsevier风格）
+                                ref_line = f"{authors_str}. {title}."
+                                
+                                # 添加发表信息（期刊名等，但不包括年份）
+                                if cleaned_published and not display_year:
+                                    # 如果cleaned_published不是年份，可能是期刊名等信息
+                                    ref_line += f" {cleaned_published}"
+                                
+                                # 添加年份
+                                if display_year:
+                                    if cleaned_published and not display_year:
+                                        ref_line += f", {display_year}"
+                                    else:
+                                        ref_line += f" {display_year}"
+                                
+                                if doi:
+                                    # 标准化DOI（移除URL前缀）
+                                    clean_doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").replace("doi:", "")
+                                    ref_line += f" DOI: {clean_doi}"
+                                elif url:
+                                    ref_line += f" {url}"
                             else:
-                                if year:
-                                    ref_line = f"{authors_str} ({year}). {ref['title']}"
+                                # 英文格式（Elsevier风格）
+                                # 格式：Author(s). Title. Journal/Publication, Year. DOI: xxx
+                                ref_line = f"{authors_str} {title}."
+                                
+                                # 添加发表信息（期刊名等，但不包括年份）
+                                if cleaned_published and not display_year:
+                                    # 如果cleaned_published不是年份，可能是期刊名等信息
+                                    ref_line += f" {cleaned_published}"
+                                
+                                # 添加年份
+                                if display_year:
+                                    if cleaned_published and not display_year:
+                                        ref_line += f", {display_year}."
+                                    else:
+                                        ref_line += f" {display_year}."
                                 else:
-                                    ref_line = f"{authors_str}. {ref['title']}"
-                                if ref['published']:
-                                    ref_line += f". {ref['published']}"
-                                if ref['doi']:
-                                    ref_line += f". DOI: {ref['doi']}"
-                                elif ref['url']:
-                                    ref_line += f". URL: {ref['url']}"
+                                    ref_line += "."
+                                
+                                if doi:
+                                    # 标准化DOI（移除URL前缀）
+                                    clean_doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").replace("doi:", "")
+                                    ref_line += f" DOI: {clean_doi}"
+                                elif url:
+                                    ref_line += f" {url}"
                             
                             references_text += ref_line + "\n\n"
                         
@@ -779,16 +1015,12 @@ async def paper_review(request: Request):
                     yield "data: [DONE]\n\n"
                     return
                 
-                if len(pdf_text) > 15000:
-                    truncate_msg = "\n\n[文本已截断...]" if language == 'zh' else "\n\n[Text truncated...]"
-                    pdf_text = pdf_text[:15000] + truncate_msg
-                
                 if language == 'zh':
                     prompt = f"""评审以下论文：
 
 论文内容:
 
-{pdf_text[:15000]}
+{pdf_text}
 
 指令: {query}"""
                 else:
@@ -796,7 +1028,7 @@ async def paper_review(request: Request):
 
 Paper:
 
-{pdf_text[:15000]}
+{pdf_text}
 
 Instruction: {query}"""
 

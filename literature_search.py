@@ -52,7 +52,9 @@ class LiteratureSearcher:
                     'abstract': entry.find('atom:summary', ns).text.strip() if entry.find('atom:summary', ns) is not None else '',
                     'published': entry.find('atom:published', ns).text if entry.find('atom:published', ns) is not None else '',
                     'pdf_url': None,
-                    'url': None
+                    'url': None,
+                    'doi': None,  # arXiv通常没有DOI
+                    'referenced_works': []  # arXiv API不提供引用信息
                 }
 
                 for link in entry.findall('atom:link', ns):
@@ -148,8 +150,15 @@ class LiteratureSearcher:
                         'published': year,
                         'pmid': pmid,
                         'url': f"https://pubmed.ncbi.nlm.nih.gov/{pmid}" if pmid else None,
-                        'pdf_url': None  
+                        'pdf_url': None,
+                        'doi': None,  # PubMed可能需要从其他字段获取
+                        'referenced_works': []  # PubMed API需要单独请求引用信息
                     }
+                    
+                    # 尝试从PubMed记录中获取DOI
+                    doi_elem = article.find('.//ELocationID[@EIdType="doi"]')
+                    if doi_elem is not None:
+                        paper['doi'] = doi_elem.text
                     papers.append(paper)
                 except Exception as e:
                     print(f"解析PubMed文章错误: {e}")
@@ -220,8 +229,14 @@ class LiteratureSearcher:
                     "doi": work.get("doi", ""),
                     "url": work.get("primary_location", {}).get("landing_page_url") or work.get("id"),
                     "pdf_url": None,
-                    "openalex_id": work.get("id", "").split("/")[-1] if work.get("id") else ""
+                    "openalex_id": work.get("id", "").split("/")[-1] if work.get("id") else "",
+                    "referenced_works": []  # 引用的文献列表（OpenAlex ID）
                 }
+                
+                # 获取引用的文献信息（如果有）
+                referenced_works = work.get("referenced_works", [])
+                if referenced_works:
+                    paper["referenced_works"] = referenced_works[:50]  # 限制前50个引用
                 
                 # 如果没有摘要，记录需要补充的文献
                 if not abstract:
@@ -322,8 +337,19 @@ class LiteratureSearcher:
                                 item.get("published-online", {}).get("date-parts", [[None]])[0][0] if item.get("published-online") else None,
                     "doi": item.get("DOI", ""),
                     "url": f"https://doi.org/{item.get('DOI', '')}" if item.get("DOI") else None,
-                    "pdf_url": None
+                    "pdf_url": None,
+                    "referenced_works": []  # 引用的文献列表
                 }
+                
+                # Crossref API中的引用文献信息在reference字段中
+                references = item.get("reference", [])
+                if references:
+                    referenced_dois = []
+                    for ref in references[:50]:  # 限制前50个引用
+                        ref_doi = ref.get("DOI", "")
+                        if ref_doi:
+                            referenced_dois.append(ref_doi)
+                    paper["referenced_works"] = referenced_dois
                 
                 if paper["doi"]:
                     paper["url"] = f"https://doi.org/{paper['doi']}"
@@ -508,6 +534,481 @@ class LiteratureSearcher:
                 return " ".join([w[1] for w in words])
         return ""
 
+    def _normalize_doi(self, doi: str) -> str:
+        """标准化DOI格式"""
+        if not doi:
+            return ""
+        
+        # 移除可能的URL前缀
+        doi = doi.strip()
+        if doi.startswith("https://doi.org/"):
+            doi = doi.replace("https://doi.org/", "")
+        elif doi.startswith("http://doi.org/"):
+            doi = doi.replace("http://doi.org/", "")
+        elif doi.startswith("doi:"):
+            doi = doi.replace("doi:", "")
+        
+        return doi.strip()
+
+    async def _get_abstract_by_doi(self, doi: str) -> str:
+        """
+        通过DOI从多个数据源获取摘要（备用方案）
+        
+        Args:
+            doi: 标准化后的DOI
+            
+        Returns:
+            摘要文本，如果获取失败返回空字符串
+        """
+        if not doi:
+            return ""
+        
+        # 标准化DOI
+        normalized_doi = self._normalize_doi(doi)
+        if not normalized_doi:
+            return ""
+        
+        # 尝试从Crossref获取摘要
+        try:
+            crossref_url = f"https://api.crossref.org/works/{normalized_doi}"
+            crossref_response = await self.client.get(crossref_url, timeout=5.0)
+            
+            if crossref_response.status_code == 200:
+                crossref_data = crossref_response.json()
+                message = crossref_data.get("message", {})
+                
+                # 提取摘要
+                abstract_data = message.get("abstract")
+                if abstract_data:
+                    if isinstance(abstract_data, str):
+                        return abstract_data
+                    elif isinstance(abstract_data, dict):
+                        abstract_text = abstract_data.get("text", "")
+                        if abstract_text:
+                            return abstract_text
+        except Exception as e:
+            pass
+        
+        # 尝试从Semantic Scholar获取摘要（需要API key，但也可以不用）
+        try:
+            # Semantic Scholar API（不需要API key，但有rate limit）
+            ss_url = f"https://api.semanticscholar.org/v1/paper/{normalized_doi}"
+            ss_response = await self.client.get(ss_url, timeout=5.0)
+            
+            if ss_response.status_code == 200:
+                ss_data = ss_response.json()
+                abstract = ss_data.get("abstract", "")
+                if abstract:
+                    return abstract
+        except Exception as e:
+            pass
+        
+        # 如果DOI看起来像PubMed的，尝试从PubMed获取
+        try:
+            # 先通过Crossref查找是否有PubMed ID
+            crossref_url = f"https://api.crossref.org/works/{normalized_doi}"
+            crossref_response = await self.client.get(crossref_url, timeout=5.0)
+            
+            if crossref_response.status_code == 200:
+                crossref_data = crossref_response.json()
+                message = crossref_data.get("message", {})
+                
+                # 查找PubMed ID
+                alternative_ids = message.get("alternative-id", [])
+                pmids = [pid for pid in alternative_ids if isinstance(pid, str) and pid.isdigit()]
+                
+                if pmids:
+                    # 通过PubMed ID获取摘要
+                    pmid = pmids[0]
+                    pubmed_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+                    pubmed_params = {
+                        "db": "pubmed",
+                        "id": pmid,
+                        "retmode": "xml"
+                    }
+                    
+                    pubmed_response = await self.client.get(pubmed_url, params=pubmed_params, timeout=5.0)
+                    if pubmed_response.status_code == 200:
+                        root = ET.fromstring(pubmed_response.text)
+                        abstract_elem = root.find('.//AbstractText')
+                        if abstract_elem is not None and abstract_elem.text:
+                            return abstract_elem.text.strip()
+        except Exception as e:
+            pass
+        
+        return ""
+
+    async def get_references_for_paper(self, paper: Dict) -> List[Dict]:
+        """
+        获取文献的参考文献列表
+        
+        Args:
+            paper: 文献信息字典，应包含 openalex_id 或 doi
+            
+        Returns:
+            参考文献列表，每个包含基本信息（title, authors, doi等）
+        """
+        references = []
+        
+        try:
+            # 优先使用OpenAlex获取引用信息
+            if paper.get("openalex_id") or paper.get("doi"):
+                detail_url = None
+                paper_identifier = None
+                
+                if paper.get("openalex_id"):
+                    work_id = paper["openalex_id"]
+                    detail_url = f"https://api.openalex.org/works/{work_id}"
+                    paper_identifier = f"OpenAlex ID: {work_id}"
+                elif paper.get("doi"):
+                    # 标准化DOI格式
+                    doi = self._normalize_doi(paper['doi'])
+                    if doi:
+                        detail_url = f"https://api.openalex.org/works/doi:{doi}"
+                        paper_identifier = f"DOI: {doi}"
+                    else:
+                        print(f"DOI格式无效: {paper.get('doi')}")
+                        return references
+                else:
+                    return references
+                
+                print(f"正在通过 {paper_identifier} 获取引用信息...")
+                print(f"   URL: {detail_url}")
+                
+                detail_response = await self.client.get(detail_url, timeout=10.0)
+                
+                if detail_response.status_code == 200:
+                    detail_data = detail_response.json()
+                    
+                    # 检查是否真的找到了文献
+                    if not detail_data.get("id"):
+                        print(f"OpenAlex未找到该文献")
+                        return references
+                    
+                    print(f"成功获取文献信息: {detail_data.get('title', 'N/A')[:60]}...")
+                    
+                    referenced_works = detail_data.get("referenced_works", [])
+                    
+                    if not referenced_works:
+                        print(f"该文献没有引用信息（referenced_works为空）")
+                        return references
+                    
+                    print(f"找到 {len(referenced_works)} 个引用文献")
+                    
+                    # 批量获取引用的文献详情（限制并发）
+                    semaphore = asyncio.Semaphore(5)
+                    failed_count = 0
+                    not_found_count = 0
+                    
+                    async def fetch_ref_info(ref_url: str):
+                        nonlocal failed_count, not_found_count
+                        async with semaphore:
+                            try:
+                                # 将OpenAlex Web URL转换为API URL
+                                api_url = ref_url
+                                if ref_url.startswith('https://openalex.org/'):
+                                    # 格式: https://openalex.org/W4322580283
+                                    work_id = ref_url.split('/')[-1]
+                                    api_url = f"https://api.openalex.org/works/{work_id}"
+                                elif ref_url.startswith('http://openalex.org/'):
+                                    work_id = ref_url.split('/')[-1]
+                                    api_url = f"https://api.openalex.org/works/{work_id}"
+                                elif not ref_url.startswith('https://api.openalex.org/'):
+                                    # 如果不是API URL，可能是OpenAlex ID，尝试构造API URL
+                                    if ref_url.startswith('W'):
+                                        # OpenAlex ID格式: W4322580283
+                                        api_url = f"https://api.openalex.org/works/{ref_url}"
+                                
+                                ref_response = await self.client.get(api_url, timeout=5.0)
+                                
+                                if ref_response.status_code == 200:
+                                    # 检查响应内容类型
+                                    content_type = ref_response.headers.get('content-type', '').lower()
+                                    if 'application/json' not in content_type:
+                                        failed_count += 1
+                                        return None
+                                    
+                                    try:
+                                        ref_data = ref_response.json()
+                                    except Exception as json_error:
+                                        failed_count += 1
+                                        return None
+                                    
+                                    # 检查返回的数据是否有效
+                                    if not ref_data or not ref_data.get("id"):
+                                        failed_count += 1
+                                        return None
+                                    
+                                    # 提取摘要
+                                    abstract = ""
+                                    if ref_data.get("abstract"):
+                                        abstract = self._extract_abstract_from_openalex_data(ref_data)
+                                    
+                                    # 如果OpenAlex没有摘要，尝试从其他数据源获取
+                                    if not abstract:
+                                        doi = ref_data.get("doi", "")
+                                        if doi:
+                                            abstract = await self._get_abstract_by_doi(doi)
+                                    
+                                    ref_paper = {
+                                        "title": ref_data.get("title", ""),
+                                        "authors": [a.get("author", {}).get("display_name", "") 
+                                                  for a in ref_data.get("authorships", [])[:3]],
+                                        "abstract": abstract,
+                                        "doi": ref_data.get("doi", ""),
+                                        "published": ref_data.get("publication_date", ""),
+                                        "url": ref_data.get("primary_location", {}).get("landing_page_url") or ref_data.get("id", ""),
+                                        "openalex_id": ref_data.get("id", "").split("/")[-1] if ref_data.get("id") else ""
+                                    }
+                                    return ref_paper
+                                elif ref_response.status_code == 404:
+                                    # 404是正常现象：某些引用文献在OpenAlex数据库中可能不存在或已被移除
+                                    not_found_count += 1
+                                    return None
+                                else:
+                                    failed_count += 1
+                                    return None
+                            except Exception as e:
+                                failed_count += 1
+                                return None
+                    
+                    ref_tasks = [fetch_ref_info(ref_url) for ref_url in referenced_works[:20]]  # 限制前20个
+                    ref_results = await asyncio.gather(*ref_tasks, return_exceptions=True)
+                    
+                    for ref_result in ref_results:
+                        if isinstance(ref_result, dict) and ref_result:
+                            references.append(ref_result)
+                        elif isinstance(ref_result, Exception):
+                            failed_count += 1
+                    
+                    # 显示统计信息
+                    success_count = len(references)
+                    total_attempted = min(len(referenced_works), 20)
+                    print(f"成功获取 {success_count} 篇引用文献的详细信息")
+                    if not_found_count > 0 or failed_count > 0:
+                        print(f"   统计: 尝试 {total_attempted} 个, 成功 {success_count} 个, 未找到 {not_found_count} 个, 失败 {failed_count} 个")
+                        if not_found_count > 0:
+                            print(f"   注: 部分引用文献在OpenAlex中不存在（404），这是正常现象")
+                            print(f"       可能原因: 数据库不完整、文献已移除、ID变更等")
+                else:
+                    print(f"获取文献详情失败")
+                    print(f"   状态码: {detail_response.status_code}")
+                    print(f"   URL: {detail_url}")
+                    
+                    if detail_response.status_code == 404:
+                        print(f"   原因: 文献未找到（可能是DOI不正确或OpenAlex中没有该文献）")
+                    elif detail_response.status_code == 429:
+                        print(f"   原因: API请求频率限制，请稍后再试")
+                    else:
+                        try:
+                            error_text = detail_response.text[:200]
+                            print(f"   错误信息: {error_text}")
+                        except:
+                            pass
+        
+        except Exception as e:
+            print(f"获取参考文献列表错误: {e}")
+            import traceback
+            print(f"   详细错误:")
+            traceback.print_exc()
+        
+        return references
+
+    async def get_top_cited_references_from_papers(self, papers: List[Dict], top_n: int = 10) -> List[Dict]:
+        """
+        从检索到的文献中提取所有引用文献，按引用量排序，返回前n个
+        
+        Args:
+            papers: 文献列表（从搜索结果中获取）
+            top_n: 返回引用量前n个的文献
+            
+        Returns:
+            按引用量排序的引用文献列表（前n个），包含摘要等信息
+        """
+        print(f"\n开始提取引用文献，目标：找到引用量前 {top_n} 的文献...")
+        
+        # 1. 收集所有引用文献的标识符
+        all_referenced_ids = set()
+        referenced_mapping = {}  # 用于记录引用关系
+        
+        for paper in papers:
+            referenced_works = paper.get('referenced_works', [])
+            if referenced_works:
+                for ref_id in referenced_works:
+                    if isinstance(ref_id, str) and ref_id:
+                        all_referenced_ids.add(ref_id)
+                        # 记录哪些文献引用了这个引用文献
+                        if ref_id not in referenced_mapping:
+                            referenced_mapping[ref_id] = {
+                                'ref_id': ref_id,
+                                'cited_by_papers': []
+                            }
+                        referenced_mapping[ref_id]['cited_by_papers'].append(paper.get('title', 'Unknown'))
+        
+        if not all_referenced_ids:
+            print("未找到引用文献")
+            return []
+        
+        print(f"共找到 {len(all_referenced_ids)} 个唯一的引用文献")
+        
+        # 2. 批量获取引用文献的详细信息（包括引用量）
+        referenced_papers = []
+        semaphore = asyncio.Semaphore(10)  # 限制并发数
+        
+        async def fetch_reference_info(ref_id: str):
+            """获取单个引用文献的详细信息"""
+            async with semaphore:
+                try:
+                    # 判断ref_id的类型并构造API URL
+                    detail_url = ref_id
+                    if ref_id.startswith('https://openalex.org/'):
+                        # Web URL格式: https://openalex.org/W4322580283
+                        work_id = ref_id.split('/')[-1]
+                        detail_url = f"https://api.openalex.org/works/{work_id}"
+                    elif ref_id.startswith('http://openalex.org/'):
+                        work_id = ref_id.split('/')[-1]
+                        detail_url = f"https://api.openalex.org/works/{work_id}"
+                    elif ref_id.startswith('https://api.openalex.org/'):
+                        # 已经是API URL，直接使用
+                        detail_url = ref_id
+                    elif ref_id.startswith('http'):
+                        # 其他HTTP URL，可能需要检查是否为OpenAlex格式
+                        if 'openalex.org' in ref_id and not 'api.openalex.org' in ref_id:
+                            # 如果是openalex.org但不是api.openalex.org，转换为API URL
+                            work_id = ref_id.split('/')[-1]
+                            detail_url = f"https://api.openalex.org/works/{work_id}"
+                        else:
+                            # 其他URL，尝试直接使用
+                            detail_url = ref_id
+                    elif '/' in ref_id:
+                        # 可能是 OpenAlex ID (格式: W4322580283)
+                        if ref_id.startswith('W'):
+                            detail_url = f"https://api.openalex.org/works/{ref_id}"
+                        else:
+                            detail_url = f"https://api.openalex.org/works/{ref_id}"
+                    else:
+                        # 可能是DOI，先标准化
+                        normalized_doi = self._normalize_doi(ref_id)
+                        if normalized_doi:
+                            detail_url = f"https://api.openalex.org/works/doi:{normalized_doi}"
+                        elif ref_id.startswith('W'):
+                            # 可能是OpenAlex ID（没有斜杠）
+                            detail_url = f"https://api.openalex.org/works/{ref_id}"
+                        else:
+                            # 如果标准化失败，尝试直接使用
+                            detail_url = f"https://api.openalex.org/works/doi:{ref_id}"
+                    
+                    response = await self.client.get(detail_url, timeout=5.0)
+                    if response.status_code == 200:
+                        # 检查响应内容类型
+                        content_type = response.headers.get('content-type', '').lower()
+                        if 'application/json' not in content_type:
+                            print(f"响应不是JSON格式，Content-Type: {content_type}, URL: {detail_url}")
+                            return None
+                        
+                        try:
+                            data = response.json()
+                        except Exception as json_error:
+                            print(f"JSON解析失败: {json_error}, URL: {detail_url}")
+                            print(f"   响应内容（前200字符）: {response.text[:200]}")
+                            return None
+                        
+                        # 检查返回的数据是否有效
+                        if not data or not data.get("id"):
+                            print(f"返回的数据无效: {detail_url}")
+                            return None
+                        
+                        # 提取摘要
+                        abstract = ""
+                        if data.get("abstract"):
+                            abstract = self._extract_abstract_from_openalex_data(data)
+                        
+                        # 如果OpenAlex没有摘要，尝试从其他数据源获取
+                        if not abstract:
+                            doi = data.get("doi", "")
+                            if doi:
+                                abstract = await self._get_abstract_by_doi(doi)
+                        
+                        # 获取引用量
+                        cited_by_count = data.get("cited_by_count", 0)
+                        
+                        ref_paper = {
+                            "title": data.get("title", ""),
+                            "authors": [a.get("author", {}).get("display_name", "") 
+                                      for a in data.get("authorships", [])[:5]],
+                            "abstract": abstract,
+                            "doi": data.get("doi", ""),
+                            "published": data.get("publication_date", ""),
+                            "cited_by_count": cited_by_count,  # 引用量
+                            "url": data.get("primary_location", {}).get("landing_page_url") or data.get("id", ""),
+                            "openalex_id": data.get("id", "").split("/")[-1] if data.get("id") else "",
+                            "source": "OpenAlex (Cited Reference)",
+                            "cited_by_papers": referenced_mapping.get(ref_id, {}).get('cited_by_papers', [])
+                        }
+                        
+                        # 尝试获取PDF链接
+                        for location in data.get("locations", []):
+                            if location.get("pdf_url"):
+                                ref_paper["pdf_url"] = location["pdf_url"]
+                                break
+                        
+                        if not ref_paper.get("pdf_url"):
+                            oa_info = data.get("open_access", {})
+                            if oa_info.get("oa_url"):
+                                ref_paper["pdf_url"] = oa_info["oa_url"]
+                        
+                        return ref_paper
+                    elif response.status_code == 404:
+                        # 404是正常现象，不打印错误信息（会在统计中显示）
+                        return None
+                    else:
+                        # 其他错误也不打印，避免信息过多
+                        return None
+                except Exception as e:
+                    # 静默处理异常，避免信息过多
+                    return None
+        
+        # 批量获取引用文献信息
+        print(f"正在批量获取 {len(all_referenced_ids)} 个引用文献的详细信息...")
+        ref_tasks = [fetch_reference_info(ref_id) for ref_id in list(all_referenced_ids)]
+        ref_results = await asyncio.gather(*ref_tasks, return_exceptions=True)
+        
+        # 统计信息
+        success_count = 0
+        not_found_count = 0
+        failed_count = 0
+        
+        # 过滤掉失败的结果
+        for result in ref_results:
+            if isinstance(result, dict) and result:
+                referenced_papers.append(result)
+                success_count += 1
+            elif isinstance(result, Exception):
+                failed_count += 1
+        
+        # 计算404的数量（会在fetch_reference_info中记录，这里简化处理）
+        total_attempted = len(all_referenced_ids)
+        not_found_count = total_attempted - success_count - failed_count
+        
+        print(f"成功获取 {success_count} 个引用文献的详细信息")
+        if not_found_count > 0 or failed_count > 0:
+            print(f"   统计: 尝试 {total_attempted} 个, 成功 {success_count} 个, 未找到 {not_found_count} 个, 失败 {failed_count} 个")
+            if not_found_count > 0:
+                print(f"   注: 部分引用文献在OpenAlex中不存在（404），这是正常现象")
+                print(f"       可能原因: 数据库不完整、文献已移除、ID变更、版权限制等")
+        
+        # 3. 按引用量排序
+        referenced_papers.sort(key=lambda x: x.get('cited_by_count', 0), reverse=True)
+        
+        # 4. 返回前n个
+        top_references = referenced_papers[:top_n]
+        
+        print(f"返回引用量前 {len(top_references)} 的文献:")
+        for i, ref in enumerate(top_references[:5], 1):  # 只打印前5个
+            print(f"  {i}. {ref.get('title', 'N/A')[:60]}... (引用量: {ref.get('cited_by_count', 0)})")
+        
+        return top_references
+
     async def search_and_extract(self, query: str, max_results: int = 10,
                                  extract_pdf: bool = True,
                                  sources: Optional[List[str]] = None,
@@ -630,6 +1131,52 @@ class LiteratureSearcher:
 
         print(f"搜索完成，共找到{len(all_papers)}篇文献")
         return all_papers
+
+    async def search_and_extract_with_top_references(self, query: str, max_results: int = 10,
+                                                     extract_pdf: bool = True,
+                                                     sources: Optional[List[str]] = None,
+                                                     sort_by: str = "date",
+                                                     extract_top_cited_refs: bool = True,
+                                                     top_cited_n: int = 10) -> Dict:
+        """
+        搜索文献并提取内容，同时提取引用量前n的引用文献
+        
+        Args:
+            query: 搜索主题
+            max_results: 每个数据源的最大结果数
+            extract_pdf: 是否下载并提取PDF内容
+            sources: 要使用的数据源列表
+            sort_by: 排序方式，"date" 按时间排序，"citations" 按引用次数排序
+            extract_top_cited_refs: 是否提取引用量前n的引用文献
+            top_cited_n: 返回引用量前n的引用文献数量
+            
+        Returns:
+            包含搜索结果和顶级引用文献的字典：
+            {
+                "papers": List[Dict],  # 搜索结果
+                "top_cited_references": List[Dict]  # 引用量前n的引用文献
+            }
+        """
+        # 先进行常规搜索
+        papers = await self.search_and_extract(
+            query=query,
+            max_results=max_results,
+            extract_pdf=extract_pdf,
+            sources=sources,
+            sort_by=sort_by
+        )
+        
+        result = {
+            "papers": papers,
+            "top_cited_references": []
+        }
+        
+        # 如果启用了提取顶级引用文献功能
+        if extract_top_cited_refs and papers:
+            top_references = await self.get_top_cited_references_from_papers(papers, top_n=top_cited_n)
+            result["top_cited_references"] = top_references
+        
+        return result
 
     async def close(self):
         """关闭HTTP客户端"""
